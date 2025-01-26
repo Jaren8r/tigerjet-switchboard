@@ -1,0 +1,20 @@
+secret: "" # if set, this secret will be required for clients to connect
+cygwin-path: C:\cygwin64 # if running on windows, set this to the directory cygwin w/ minimodem is installed
+caller-id: after-first-ring # after-first-ring, before-first-ring
+dialers:
+  default:
+    type: client
+    client: gvoice # name/id of the connected client
+    format: phone # can be either phone or a regexp. if a regexp with a capturing group is provided, the number is rewritten to the capturing group's value
+    region: US # if format is phone, this sets the default country for numbers without country codes
+    dial-tone: [350, 440] # dial tone frequencies
+  '#':
+    type: map
+    numbers: # a map of numbers to [client, number]
+      123: [sound, seizure.wav]
+      456: [discord, 86262214066970624]
+      789: [gvoice, 13034997111]
+    dial-tone: [400]
+whitelists: # if defined for a client, your phone will only ring if these numbers call you
+  discord:
+    - 86262214066970624
