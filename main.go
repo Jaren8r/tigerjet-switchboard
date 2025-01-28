@@ -128,16 +128,6 @@ func main() {
 		MaxAge:           300,
 	}))
 
-	r.Get("/status", func(w http.ResponseWriter, r *http.Request) {
-		secret := r.URL.Query().Get("secret")
-		if secret != config.Secret {
-			render.Status(r, http.StatusUnauthorized)
-			render.PlainText(w, r, "invalid secret")
-			return
-		}
-
-	})
-
 	r.Post("/callerid", func(w http.ResponseWriter, r *http.Request) {
 		secret := r.URL.Query().Get("secret")
 		if secret != config.Secret {
