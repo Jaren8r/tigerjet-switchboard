@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -9,25 +12,130 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+	"unsafe"
 
-	"github.com/gopxl/beep/v2"
-	"github.com/gopxl/beep/v2/mp3"
-	"github.com/gopxl/beep/v2/speaker"
-	"github.com/gopxl/beep/v2/wav"
+	"github.com/gen2brain/malgo"
+	"github.com/sasha-s/go-deadlock"
+	"github.com/youpy/go-wav"
 )
 
-var audioMu sync.Mutex
+var dialingFrequencies = []float64{440, 480}
+var dialingOnOff = [2]int{sampleRate * 2, sampleRate * 4}
+var busyFrequencies = []float64{480, 620}
+var busyOnOff = [2]int{sampleRate / 2, sampleRate / 2}
 
-type toneStreamer struct {
-	sampleRate  float64
+type audioDeviceId struct {
+	malgo malgo.DeviceID
+	id    string
+}
+
+func (a audioDeviceId) MarshalJSON() ([]byte, error) {
+	return json.Marshal(a.id)
+}
+
+func resolveAudioDeviceIDs(serial string) (audioDeviceIds, error) {
+	input, err := resolveAudioDeviceID(serial, malgo.Capture)
+	if err != nil {
+		return audioDeviceIds{}, err
+	}
+
+	output, err := resolveAudioDeviceID(serial, malgo.Playback)
+	if err != nil {
+		return audioDeviceIds{}, err
+	}
+
+	return audioDeviceIds{
+		Serial: serial,
+		Input:  input,
+		Output: output,
+	}, nil
+}
+
+type audioDeviceIds struct {
+	Serial string        `json:"serial"`
+	Input  audioDeviceId `json:"input"`
+	Output audioDeviceId `json:"output"`
+}
+
+type audioDevice struct {
+	mu           deadlock.Mutex
+	device       *malgo.Device
+	source       audioSource
+	doneCallback func()
+}
+
+func (d *audioDevice) stop() {
+	if d.doneCallback != nil {
+		d.doneCallback()
+		d.doneCallback = nil
+	}
+
+	d.source = nil
+}
+
+func (d *audioDevice) Stop() {
+	d.mu.Lock()
+	d.stop()
+	d.mu.Unlock()
+}
+
+func (d *audioDevice) Play(s audioSource) {
+	d.mu.Lock()
+
+	d.stop()
+	d.source = s
+
+	d.mu.Unlock()
+}
+
+func (d *audioDevice) PlayAndWait(s audioSource) {
+	ch := make(chan struct{})
+
+	d.mu.Lock()
+
+	d.stop()
+	d.source = s
+	d.doneCallback = func() {
+		ch <- struct{}{}
+		close(ch)
+	}
+
+	d.mu.Unlock()
+
+	<-ch
+}
+
+func (d *audioDevice) PlayCallerID(data calleridData) error {
+	if data.Time.IsZero() {
+		data.Time = time.Now()
+	}
+
+	streamer, err := newCallerIdSource(data)
+	if err != nil {
+		return err
+	}
+
+	d.PlayAndWait(streamer)
+
+	return nil
+}
+
+type audioSource interface {
+	Read(bytes []byte) (done bool)
+}
+
+type toneSource struct {
 	frequencies []float64
 	offset      int
 	onOff       [2]int
 }
 
-func (s *toneStreamer) Stream(samples [][2]float64) (n int, ok bool) {
+func (s *toneSource) Read(bytes []byte) (done bool) {
+	numSamples := len(bytes) / 2
+
+	samples := unsafe.Slice((*int16)(unsafe.Pointer(&bytes[0])), numSamples)
+
 	totalOnOff := s.onOff[0] + s.onOff[1]
 
 	for i := range samples {
@@ -35,46 +143,46 @@ func (s *toneStreamer) Stream(samples [][2]float64) (n int, ok bool) {
 
 		if totalOnOff == 0 {
 			for _, freq := range s.frequencies {
-				point += math.Sin(float64(i+s.offset)*(freq/s.sampleRate)*math.Pi*2) * 0.2
+				point += math.Sin(float64(i+s.offset)*(freq/sampleRate)*math.Pi*2) * 0.2
 			}
+
+			samples[i] = int16(math.Round(point * 32767))
 		} else {
 			onOffPoint := (i + s.offset) % totalOnOff
 
 			if onOffPoint <= s.onOff[0] {
 				for _, freq := range s.frequencies {
-					point += math.Sin(float64(i+s.offset)*(freq/s.sampleRate)*math.Pi*2) * 0.2
+					point += math.Sin(float64(i+s.offset)*(freq/sampleRate)*math.Pi*2) * 0.2
 				}
+
+				samples[i] = int16(math.Round(point * 32767))
 			}
 		}
-
-		samples[i] = [2]float64{point, point}
 	}
 
-	s.offset += len(samples)
+	s.offset += numSamples
 
-	return len(samples), true
+	return false
 }
 
-func (s *toneStreamer) Err() error {
-	return nil
-}
-
-type callerIdStreamer struct {
+type callerIdSource struct {
 	stage         uint8
 	dir           string
-	payloadStream beep.StreamSeekCloser
-	ch            <-chan beep.StreamSeekCloser
+	offset        int
+	payloadFile   *os.File
+	payloadStream *wav.Reader
+	ch            <-chan *wav.Reader
 }
 
-func newCallerIdStreamer(data calleridData) (*callerIdStreamer, error) {
+func newCallerIdSource(data calleridData) (*callerIdSource, error) {
 	dir, err := os.MkdirTemp("", "callerid")
 	if err != nil {
 		return nil, err
 	}
 
-	ch := make(chan beep.StreamSeekCloser)
+	ch := make(chan *wav.Reader)
 
-	cidStreamer := &callerIdStreamer{
+	cidSource := &callerIdSource{
 		dir: dir,
 		ch:  ch,
 	}
@@ -120,160 +228,147 @@ func newCallerIdStreamer(data calleridData) (*callerIdStreamer, error) {
 			panic(err)
 		}
 
-		outputFile, err := os.Open(path.Join(dir, "output.wav"))
+		cidSource.payloadFile, err = os.Open(path.Join(dir, "output.wav"))
 		if err != nil {
 			panic(err)
 		}
 
-		streamer, _, err := wav.Decode(outputFile)
-		if err != nil {
-			panic(err)
-		}
-
-		ch <- streamer
+		ch <- wav.NewReader(cidSource.payloadFile)
 		close(ch)
 	}()
 
-	return cidStreamer, nil
+	return cidSource, nil
 }
 
-func (s *callerIdStreamer) Stream(samples [][2]float64) (n int, ok bool) {
+func (s *callerIdSource) Read(bytes []byte) (done bool) {
 	filled := 0
-loop:
-	for filled < len(samples) {
+
+	for filled < len(bytes) {
 		switch s.stage {
 		case 0:
-			n, ok := seizureSteamer.Stream(samples[filled:])
-			if !ok {
-				seizureSteamer.Seek(0)
-
+			n := copy(bytes[filled:], seizureData[s.offset:])
+			filled += n
+			s.offset += n
+			if len(seizureData[s.offset:]) == 0 {
+				s.offset = 0
 				s.stage += 1
 			}
-
-			filled += n
 		case 1, 3:
-			n, ok := carrierSteamer.Stream(samples[filled:])
-			if !ok {
-				carrierSteamer.Seek(0)
-
+			n := copy(bytes[filled:], carrierData[s.offset:])
+			filled += n
+			s.offset += n
+			if len(carrierData[s.offset:]) == 0 {
+				s.offset = 0
 				s.stage += 1
 			}
-
-			filled += n
 		case 2:
 			if s.payloadStream == nil {
 				s.payloadStream = <-s.ch
 			}
 
-			n, ok := s.payloadStream.Stream(samples[filled:])
-			if !ok {
-				s.payloadStream.Close()
-				os.RemoveAll(s.dir)
-				s.stage += 1
-			}
+			n, err := io.ReadFull(s.payloadStream, bytes)
 
 			filled += n
-		default:
-			if filled == 0 {
-				return 0, false
+
+			if err != nil {
+				if errors.Is(err, io.ErrUnexpectedEOF) {
+					s.stage += 1
+				} else {
+					panic(err)
+				}
 			}
 
-			break loop
+		default:
+			return true
 		}
-
-	}
-	return filled, true
-}
-
-func (s *callerIdStreamer) Err() error {
-	return nil
-}
-
-var seizureSteamer beep.StreamSeekCloser
-var carrierSteamer beep.StreamSeekCloser
-
-type soundClient struct{}
-
-func (c soundClient) Call(file string, _ string) {
-	ext := file[strings.LastIndex(file, ".")+1:]
-
-	f, err := os.Open(file)
-	if err != nil {
-		fmt.Println(err)
-		return
 	}
 
-	var fileStreamer beep.StreamSeekCloser
-	var format beep.Format
-
-	switch ext {
-	case "mp3":
-		fileStreamer, format, err = mp3.Decode(f)
-	case "wav":
-		fileStreamer, format, err = wav.Decode(f)
-	default:
-		fmt.Printf("unknown file extension %s\n", ext)
-		return
-	}
-
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	var streamer beep.Streamer
-
-	if format.SampleRate != beep.SampleRate(sampleRate) {
-		streamer = beep.Resample(3, format.SampleRate, beep.SampleRate(sampleRate), fileStreamer)
-	} else {
-		streamer = fileStreamer
-	}
-
-	go func() {
-		speaker.PlayAndWait(streamer)
-		fileStreamer.Close()
-	}()
-}
-
-func (c soundClient) End() {
-	speaker.Clear()
-}
-
-func (c soundClient) Answer(id string) {
-
-}
-
-func (c soundClient) Disconnect() bool {
 	return false
 }
 
+func (d *audioDevice) deviceCallback(pOutputSample, pInputSamples []byte, framecount uint32) {
+	d.mu.Lock()
+	if d.source != nil {
+		done := d.source.Read(pOutputSample)
+		if done {
+			d.stop()
+		}
+	}
+	d.mu.Unlock()
+}
+
+func newAudioDevice(deviceID malgo.DeviceID) (*audioDevice, error) {
+	s := new(audioDevice)
+
+	config := malgo.DefaultDeviceConfig(malgo.Playback)
+	config.Playback.DeviceID = deviceID.Pointer()
+	config.Playback.Channels = 1
+	config.Playback.Format = malgo.FormatS16
+	config.SampleRate = uint32(sampleRate)
+
+	callbacks := malgo.DeviceCallbacks{
+		Data: s.deviceCallback,
+	}
+
+	d, err := malgo.InitDevice(audioContext.Context, config, callbacks)
+	if err != nil {
+		return nil, err
+	}
+
+	err = d.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	s.device = d
+
+	return s, nil
+}
+
+var audioContext *malgo.AllocatedContext
+var audioBackend malgo.Backend
+
+func loadWav(name string) []byte {
+	seizureFile, err := os.Open(name)
+	if err != nil {
+		panic(err)
+	}
+
+	defer seizureFile.Close()
+
+	data, err := io.ReadAll(wav.NewReader(seizureFile))
+	if err != nil {
+		panic(err)
+	}
+
+	return data
+}
+
+var seizureData = loadWav("seizure.wav")
+var carrierData = loadWav("carrier.wav")
+
 func init() {
-	clients["sound"] = soundClient{}
+	var err error
 
-	seizureFile, err := os.Open("seizure.wav")
-	if err != nil {
-		panic(err)
+	if audioBackends != nil {
+		for _, backend := range audioBackends {
+			audioContext, err = malgo.InitContext([]malgo.Backend{backend}, malgo.ContextConfig{}, nil)
+			if err != nil {
+				if errors.Is(err, malgo.ErrNoBackend) {
+					continue
+				}
+
+				panic(err)
+			}
+
+			audioBackend = backend
+			break
+		}
+	} else {
+		audioContext, err = malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+		if err != nil {
+			panic(err)
+		}
 	}
 
-	seizureSteamer, _, err = wav.Decode(seizureFile)
-	if err != nil {
-		panic(err)
-	}
-
-	carrierFile, err := os.Open("carrier.wav")
-	if err != nil {
-		panic(err)
-	}
-
-	carrierSteamer, _, err = wav.Decode(carrierFile)
-	if err != nil {
-		panic(err)
-	}
-
-	sr := beep.SampleRate(sampleRate)
-
-	err = speaker.Init(sr, sr.N(50*time.Millisecond))
-	if err != nil {
-		panic(err)
-	}
 }

@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"time"
-
-	"github.com/gopxl/beep/v2/speaker"
 )
 
 type calleridData struct {
@@ -83,23 +81,4 @@ func calleridDataToBytes(data calleridData) []byte {
 	}
 
 	return append(payload, -checksum)
-}
-
-func callerid(data calleridData) error {
-	if data.Time.IsZero() {
-		data.Time = time.Now()
-	}
-
-	audioMu.Lock()
-
-	streamer, err := newCallerIdStreamer(data)
-	if err != nil {
-		return err
-	}
-
-	speaker.PlayAndWait(streamer)
-
-	audioMu.Unlock()
-
-	return nil
 }

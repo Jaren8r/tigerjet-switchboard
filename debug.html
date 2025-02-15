@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Debug Client</title>
+</head>
+
+<body>
+    <div>Status: <span id="status" style="color: red">Disconnected</span></div>
+    <div><textarea id="callerid" rows="10" cols="50"></textarea></div>
+    <div><button id="ring">Start Ringing</button></div>
+    <div id="log" style="height: 400px; overflow: auto; white-space: pre;"></div>
+    <script>
+        const secret = encodeURIComponent(new URL(location).searchParams.get("secret") ?? "");
+        const status = document.getElementById("status");
+        const callerid = document.getElementById("callerid");
+        const ring = document.getElementById("ring");
+        const log = document.getElementById("log");
+        callerid.value = JSON.stringify({
+            id: "",
+            callerid: {
+                number: "",
+                numberNotPresent: "",
+                name: "",
+                nameNotPresent: ""
+            }
+        }, null, 4)
+        let ws;
+
+        function connect() {
+            ws = new WebSocket(`${location.origin.replace(/^http/, "ws")}/ws?client=debug&secret=${secret}`);
+            ws.addEventListener("open", () => {
+                console.log("open");
+                status.textContent = "Connected";
+                status.style.color = "green";
+            });
+            ws.addEventListener("message", e => {
+                let json = JSON.parse(e.data);
+                if (json[0] === "answer") {
+                    ring.innerText = "Start Ringing";
+                }
+                log.innerText += e.data;
+            })
+            ws.addEventListener("close", () => {
+                status.textContent = "Disconnected";
+                status.style.color = "red";
+                ring.innerText = "Start Ringing";
+                connect();
+            });
+        }
+
+        connect();
+
+        ring.addEventListener("click", () => {
+            if (ring.innerText === "Start Ringing") {
+                ring.innerText = "Stop Ringing";
+                ws.send(`["ring",${callerid.value}]`);
+            } else {
+                ring.innerText = "Start Ringing";
+
+                ws.send(JSON.stringify(["stopRinging", JSON.parse(callerid.value).id]));
+            }
+        });
+    </script>
+</body>
+
+</html>

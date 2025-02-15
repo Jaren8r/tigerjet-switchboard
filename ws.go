@@ -3,32 +3,60 @@ package main
 import (
 	"encoding/json"
 	"net/http"
-	"slices"
 
 	"github.com/go-chi/render"
-	"github.com/gopxl/beep/v2/speaker"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
-type wsClient struct {
-	ws  *websocket.Conn
-	typ string
+type wsAggregatorClient struct {
+	connections []*wsConnection
+	typ         string
 }
 
-func (c wsClient) Call(number string, _ string) {
-	c.ws.WriteJSON([2]string{"call", number})
+type wsConnection struct {
+	id            uuid.UUID
+	ws            *websocket.Conn
+	client        *wsAggregatorClient
+	currentDevice *device
 }
 
-func (c wsClient) End() {
-	c.ws.WriteJSON([2]string{"end"})
+func (c *wsAggregatorClient) Call(d *device, data callData, _ string) {
+	for _, c := range c.connections {
+		if c.currentDevice == nil {
+			c.currentDevice = d
+			c.ws.WriteJSON([2]any{"call", data})
+			break
+		}
+	}
 }
 
-func (c wsClient) Answer(id string) {
-	c.ws.WriteJSON([2]string{"answer", id})
+func (c *wsAggregatorClient) End(d *device) {
+	for _, c := range c.connections {
+		if c.currentDevice == d {
+			c.currentDevice = nil
+			c.ws.WriteJSON([1]string{"end"})
+			break
+		}
+	}
 }
 
-func (c wsClient) Disconnect() bool {
-	c.ws.Close()
+func (c *wsAggregatorClient) Answer(d *device, data callAnswerData) {
+	for _, c := range c.connections {
+		if c.id == data.ringData.clientId {
+			c.currentDevice = d
+			c.ws.WriteJSON([2]any{"answer", data})
+			break
+		}
+	}
+}
+
+func (c *wsAggregatorClient) InUse() bool {
+	for _, c := range c.connections {
+		if c.currentDevice == nil {
+			return false
+		}
+	}
 
 	return true
 }
@@ -51,30 +79,40 @@ func handleWebSocketConnection(w http.ResponseWriter, r *http.Request) {
 
 	mu.Lock()
 
+	var client *wsAggregatorClient
+
 	if existing, ok := clients[clientType]; ok {
-		if !existing.Disconnect() {
+		if client, ok = existing.(*wsAggregatorClient); !ok {
 			render.Status(r, http.StatusBadRequest)
 			render.PlainText(w, r, "unable to register as this client type")
 			return
 		}
 	}
 
-	c, err := upgrader.Upgrade(w, r, nil)
+	if client == nil {
+		client = &wsAggregatorClient{
+			typ: clientType,
+		}
+		clients[clientType] = client
+	}
+
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 
-	client := wsClient{
-		ws:  c,
-		typ: clientType,
+	conn := &wsConnection{
+		id:     uuid.New(),
+		ws:     ws,
+		client: client,
 	}
 
-	clients[clientType] = client
+	client.connections = append(client.connections, conn)
 
 	mu.Unlock()
 
 	for {
-		_, bytes, err := c.ReadMessage()
+		_, bytes, err := ws.ReadMessage()
 		if err != nil {
 			break
 		}
@@ -100,26 +138,12 @@ func handleWebSocketConnection(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
-			ringData.ClientType = client.typ
+			ringData.clientType = clientType
+			ringData.clientId = conn.id
 
-			if whitelist, ok := config.Whitelists[clientType]; ok {
-				if slices.Contains(whitelist, ringData.ID) {
-					mu.Lock()
-					if len(ringing) == 0 {
-						ring(ringData.CallerID)
-					}
-					ringing = append(ringing, ringData)
-					mu.Unlock()
-				}
-			} else {
-				mu.Lock()
-				if len(ringing) == 0 && !offHook {
-					ring(ringData.CallerID)
-				}
-				ringing = append(ringing, ringData)
-				mu.Unlock()
-			}
-
+			mu.Lock()
+			ringing.StartRinging(ringData)
+			mu.Unlock()
 		case "stopRinging":
 			var id string
 			err = json.Unmarshal(jsonParts[1], &id)
@@ -128,15 +152,7 @@ func handleWebSocketConnection(w http.ResponseWriter, r *http.Request) {
 			}
 
 			mu.Lock()
-			for i := range ringing {
-				if ringing[i].ID == id && ringing[i].ClientType == client.typ {
-					ringing = append(ringing[:i], ringing[i+1:]...)
-
-					if len(ringing) == 0 && !offHook {
-						hidDevice.SendFeatureReport(stopRinging)
-					}
-				}
-			}
+			ringing.StopRinging(id)
 			mu.Unlock()
 		case "dialing":
 			var dialing bool
@@ -145,56 +161,48 @@ func handleWebSocketConnection(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
-			if clientUsingPhone == client.typ {
-				mu.Lock()
-
+			mu.Lock()
+			if conn.currentDevice != nil {
 				if dialing {
-					speaker.Play(&toneStreamer{
-						sampleRate:  float64(sampleRate),
-						frequencies: []float64{440, 480},
-						onOff:       [2]int{sampleRate * 2, sampleRate * 4},
+					conn.currentDevice.audio.Play(&toneSource{
+						frequencies: dialingFrequencies,
+						onOff:       dialingOnOff,
 					})
 				} else {
-					speaker.Clear()
+					conn.currentDevice.audio.Stop()
 				}
-
-				mu.Unlock()
 			}
+			mu.Unlock()
+		case "end":
+			mu.Lock()
+			if conn.currentDevice != nil {
+				conn.currentDevice.clientUsingPhone = ""
+				conn.currentDevice = nil
+			}
+			mu.Unlock()
 		}
-
 	}
 
 	// On Disconnect
 
 	mu.Lock()
 
-loop:
-	for {
-		for i := range ringing {
-			if ringing[i].ClientType == client.typ {
-				ringing = append(ringing[:i], ringing[i+1:]...)
+	for i, c := range client.connections {
+		if c == conn {
+			client.connections = append(client.connections[:i], client.connections[i+1:]...)
 
-				if len(ringing) == 0 && !offHook {
-					hidDevice.SendFeatureReport(stopRinging)
-					break loop
-				}
-
-				continue loop
+			if len(client.connections) == 0 {
+				delete(clients, clientType)
 			}
+			break
 		}
-
-		break
-	}
-
-	if clientUsingPhone == clientType {
-		clientUsingPhone = ""
-	}
-
-	if clients[clientType] == client {
-		delete(clients, clientType)
 	}
 
 	mu.Unlock()
 
-	c.Close()
+	if conn.currentDevice != nil {
+		conn.currentDevice.clientUsingPhone = ""
+	}
+
+	ws.Close()
 }

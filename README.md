@@ -8,10 +8,6 @@ Use your MagicJack adapter with other VOIP applications
 # Usage
 1. Copy [config-example.yml](./config-example.yml) to config.yml and edit it in your text editor of choice. 
 2. Start tigerjet-switchboard
-3. Change the audio output of tigerjet-switchboard to your phone's output device.
-    - Windows: Settings > System > Sound > Volume mixer
-    - Mac: [Sourcesound](https://rogueamoeba.com/soundsource/) [Paid]
-    - Linux (Pipewire): Helvum
 3. Setup [Clients](#clients)
 
 # Clients
