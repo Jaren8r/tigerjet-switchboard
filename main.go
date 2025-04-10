@@ -283,6 +283,10 @@ func main() {
 		panic(err)
 	}
 
+	if len(devices) == 0 {
+		panic("no devices found")
+	}
+
 	r := chi.NewRouter()
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
