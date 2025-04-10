@@ -187,22 +187,24 @@ func (d *device) ring(cidData *calleridData) {
 				d.audio.PlayCallerID(*cidData)
 				d.startRinging()
 			}()
-		} else if config.CallerID == "after-first-ring" {
-			go func() {
-				select {
-				case <-time.After(2250 * time.Millisecond):
-					mu.Lock()
-					d.stopCallerID = nil
-					inUse := d.inUse
-					mu.Unlock()
+		} else {
+			if config.CallerID == "after-first-ring" {
+				go func() {
+					select {
+					case <-time.After(2250 * time.Millisecond):
+						mu.Lock()
+						d.stopCallerID = nil
+						inUse := d.inUse
+						mu.Unlock()
 
-					if !inUse {
-						d.audio.PlayCallerID(*cidData)
+						if !inUse {
+							d.audio.PlayCallerID(*cidData)
+						}
+					case <-ctx.Done():
+						// Cancelled
 					}
-				case <-ctx.Done():
-					// Cancelled
-				}
-			}()
+				}()
+			}
 
 			d.startRinging()
 		}
